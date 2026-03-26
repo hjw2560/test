@@ -489,17 +489,11 @@ def _table_layout_family(table_type: str, headers: List[str], stats: Dict[str, i
 
 
 def _table_info_lines(simple: Dict[str, Any], content_type: str) -> List[str]:
-    table_id = simple.get("table_id")
     stats = simple.get("stats", {})
     return [
         f"content_type={content_type}",
-        f"table_name=Table {table_id}" if table_id is not None else "table_name=Table",
-        f"table_rows={stats.get('row_count', 0)}",
-        f"table_cols={stats.get('column_count', 0)}",
-        f"header_rows={simple.get('header_row_count', 0)}",
         f"table_layout={simple.get('layout_family', simple.get('type', 'unknown'))}",
-        f"merged_cells={stats.get('merged_cells', 0)}",
-        f"multiline_cells={stats.get('multiline_cells', 0)}",
+        f"table_shape={stats.get('row_count', 0)}x{stats.get('column_count', 0)}",
     ]
 
 
@@ -562,20 +556,12 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
         for record in simple.get("records", []):
             values = record.get("values", {})
             lines = _table_info_lines(simple, "table_record")
-            if record.get("row_number") is not None:
-                lines.append(f"row_number={record.get('row_number')}")
-            if record.get("group_key"):
-                lines.append(f"group_key={record.get('group_key')}")
-            if record.get("group_label"):
-                lines.append(f"group_label={_kv_value(record.get('group_label'))}")
-            if record.get("sub_key"):
-                lines.append(f"sub_key={record.get('sub_key')}")
-            if record.get("sub_label"):
-                lines.append(f"sub_label={_kv_value(record.get('sub_label'))}")
             for key, value in values.items():
                 if value:
                     lines.append(f"{key}={_kv_value(value)}")
-            chunks.append("\n".join(line for line in lines if line).strip())
+            text = "\n".join(line for line in lines if line).strip()
+            if text:
+                chunks.append(text)
         return chunks
 
     if simple.get("layout_family") == "freeform_layout":
@@ -584,8 +570,6 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
             if not joined:
                 continue
             lines = _table_info_lines(simple, "table_layout")
-            if row.get("row_number") is not None:
-                lines.append(f"row_number={row.get('row_number')}")
             lines.append(f"layout_row={joined}")
             chunks.append("\n".join(line for line in lines if line).strip())
         return chunks
@@ -593,10 +577,6 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
     for record in simple.get("records", []):
         values = record.get("values", {})
         lines = _table_info_lines(simple, "table_record")
-        if headers:
-            lines.append("columns=" + " | ".join(headers))
-        if record.get("row_number") is not None:
-            lines.append(f"row_number={record.get('row_number')}")
         for header in headers or list(values.keys()):
             value = _normalize_multiline_text(values.get(header, ""))
             if value:
@@ -708,7 +688,7 @@ def _heuristic_table_summary(simple: Dict[str, Any]) -> str:
                 if display:
                     sample_parts.append(display)
             if sample_parts:
-                summary_lines.append("sample_1=" + " || ".join(sample_parts))
+                summary_lines.append("sample=" + " || ".join(sample_parts))
         return "\n".join(summary_lines).strip()
 
     headers = [header for header in simple.get("headers", []) if header and not _is_generic_header(header)]
@@ -725,9 +705,7 @@ def _heuristic_table_summary(simple: Dict[str, Any]) -> str:
     else:
         summary_lines.append("summary=비정형 레이아웃 표이므로 원문 행 기준으로 해석하는 것이 안전합니다.")
 
-    summary_lines.append(
-        f"structure_note=layout={layout_family}, rows={stats.get('row_count', 0)}, cols={stats.get('column_count', 0)}"
-    )
+    summary_lines.append(f"structure_note=layout={layout_family}")
 
     if simple.get("header_row_count", 0) >= 2 or stats.get("merged_cells", 0) > 0:
         summary_lines.append("ambiguity_note=multi_header_or_merged_cells_detected")
