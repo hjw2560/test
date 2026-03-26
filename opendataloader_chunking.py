@@ -529,6 +529,80 @@ def _join_non_empty(parts: List[str], sep: str = " ; ") -> str:
     return sep.join([part for part in parts if _normalize_inline_text(part)])
 
 
+def _humanize_key(key: str) -> str:
+    key = _normalize_inline_text(key).replace("_", " ").strip()
+    return key[:1].upper() + key[1:] if key else "Value"
+
+
+def _property_sheet_narrative_chunks(simple: Dict[str, Any]) -> List[str]:
+    chunks = []
+    for record in simple.get("records", []):
+        values = record.get("values", {})
+        if not values:
+            continue
+        for key, value in values.items():
+            value = _kv_value(value)
+            if not value:
+                continue
+            chunks.append(f"{_humanize_key(key)}: {value}")
+    return chunks
+
+
+def _generic_narrative_chunks(simple: Dict[str, Any]) -> List[str]:
+    headers = simple.get("headers", [])
+    key_map = _header_key_map(headers)
+    chunks = []
+
+    if simple.get("layout_family") == "freeform_layout":
+        for row in simple.get("linear_rows", []):
+            joined = " | ".join(value for value in row.get("values", []) if value != "")
+            if joined:
+                chunks.append(joined)
+        return chunks
+
+    for record in simple.get("records", []):
+        values = record.get("values", {})
+        parts = []
+        for header in headers or list(values.keys()):
+            value = _normalize_multiline_text(values.get(header, ""))
+            if not value:
+                continue
+            field_key = key_map.get(header) or _to_field_key(header)
+            parts.append(f"{_humanize_key(field_key)}: {_kv_value(value)}")
+        if parts:
+            chunks.append("\n".join(parts))
+    return chunks
+
+
+def _table_summary_narrative(simple: Dict[str, Any], raw_chunk: str) -> str:
+    llm_summary = _summarize_table_via_chat_api(simple, raw_chunk)
+    if llm_summary:
+        return llm_summary
+    heuristic = _heuristic_table_summary(simple)
+    if not heuristic:
+        return ""
+    lines = []
+    for line in heuristic.splitlines():
+        line = _normalize_inline_text(line)
+        if not line:
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "summary":
+                lines.append(value)
+            elif key.startswith("sample"):
+                lines.append(f"Examples: {value}")
+            elif key == "structure_note":
+                lines.append(f"Structure note: {value}")
+            elif key == "ambiguity_note":
+                lines.append(f"Ambiguity note: {value}")
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _build_table_raw_chunk(simple: Dict[str, Any]) -> str:
     headers = simple.get("headers", [])
     data_lines = []
@@ -1139,26 +1213,23 @@ def to_milvus_chunks(table: dict) -> list:
     if not simple:
         return []
 
-    table_id = simple.get("table_id")
-    headers = simple.get("headers", [])
-    header_line = "Columns: " + " | ".join(headers) if headers else ""
-    table_label = f"Table {table_id}" if table_id is not None else "Table"
-
     chunks = []
-    for record in simple.get("records", []):
-        values = record.get("values", {})
-        lines = [table_label]
-        if header_line:
-            lines.append(header_line)
-        for header in headers or list(values.keys()):
-            value = _normalize_multiline_text(values.get(header, ""))
-            if value:
-                lines.append(f"{header}: {value}")
-        text = "\n".join(line for line in lines if line).strip()
-        if text and text != table_label:
-            chunks.append(text)
 
-    return _dedupe_preserve_order(chunks)
+    raw_chunk = _build_table_raw_chunk(simple)
+    if raw_chunk:
+        chunks.append(raw_chunk)
+
+    if simple.get("layout_family") == "property_sheet":
+        chunks.extend(_property_sheet_narrative_chunks(simple))
+    else:
+        chunks.extend(_generic_narrative_chunks(simple))
+
+    if _should_generate_table_summary(simple):
+        summary_chunk = _table_summary_narrative(simple, raw_chunk)
+        if summary_chunk:
+            chunks.append(summary_chunk)
+
+    return _dedupe_preserve_order([chunk.strip() for chunk in chunks if chunk and chunk.strip()])
 
 
 def to_milvus_content(table: dict) -> str:
