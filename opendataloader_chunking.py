@@ -655,9 +655,26 @@ def to_milvus_content(table: dict) -> str:
 
 def _extract_heading_level(text: str) -> Optional[int]:
     text = _normalize_inline_text(text)
-    numbered = re.match(r"^(\d+(?:\.\d+)*)\s+\S", text)
-    if numbered:
-        return numbered.group(1).count(".") + 1
+
+    chapter_like = re.match(r"^(chapter|section|appendix)\s+([A-Z]+|\d+)\b", text, re.IGNORECASE)
+    if chapter_like:
+        return 1
+
+    dotted = re.match(r"^(\d+(?:\.\d+)+)\s+\S", text)
+    if dotted:
+        return dotted.group(1).count(".") + 1
+
+    coded = re.match(r"^(\d{2,})\s+\S", text)
+    if coded:
+        digits = coded.group(1)
+        # 선박 사양서에서 자주 보이는 2/3/4자리 코드형 heading:
+        # 31 -> level 2, 311 -> level 3, 3111 -> level 4
+        return min(len(digits), 4)
+
+    enumerated = re.match(r"^(\d+)[\)\-]\s+\S", text)
+    if enumerated:
+        return 5
+
     roman = re.match(r"^(?:[IVXLCM]+)\.\s+\S", text)
     if roman:
         return 1
@@ -686,6 +703,7 @@ def _is_section_heading(text: str, font: str = "") -> bool:
         and len(stripped) <= 120
         and title_like
         and not ends_like_sentence
+        and len(re.findall(r"[A-Za-z]", stripped)) >= 3
     )
 
 
@@ -703,7 +721,8 @@ def _section_path(section_stack: List[Dict[str, Any]]) -> str:
     titles = [item["title"] for item in section_stack if item.get("title")]
     if not titles:
         return ""
-    return "Section: " + " > ".join(titles)
+    # 너무 긴 prefix는 검색 효율과 가독성을 같이 떨어뜨리므로 최근 섹션만 유지합니다.
+    return " > ".join(titles[-3:])
 
 
 def _collect_elements_with_content(node: Any, out: list):
@@ -908,69 +927,9 @@ def parse_opendataloader_json_and_chunk(
                     pending_caption = {"text": caption_text, "prov": prov, "page_no": page_no}
             continue
 
-        # 이미지/그림 처리
+        # 이미지/그림은 별도 파이프라인에서 처리하므로 여기서는 완전히 제외
         if element_type in ("picture", "image"):
-            caption = _consume_pending_caption(page_no)
-            _flush_text_blocks()
-
-            if pdf_doc is None or not bbox or len(bbox) < 4:
-                continue
-
-            page_idx = int(page_no) - 1 if isinstance(page_no, int) else 0
-            try:
-                with pypdfium2_lock:
-                    pdf_page = pdf_doc[page_idx]
-                    page_img = pdf_page.render(scale=scale * 1.5, rotation=0).to_pil()
-                    page_height = pdf_page.get_height()
-            except Exception as exc:
-                logger.warning("OpenDataLoader: skip image crop page %s: %s", page_no, exc)
-                continue
-
-            cropped = _crop_bbox_pdf_points(page_img, bbox[0], bbox[1], bbox[2], bbox[3], page_height, scale)
-            image_count += 1
-            image_filename = f"image{image_count}.jpg"
-            save_path = picture_output_dir / image_filename
-            cropped.save(str(save_path), "JPEG", quality=95)
-
-            desc = _normalize_multiline_text(element.get("description") or "")
-            if enable_image_caption and qwen_model and qwen_processor and process_vision_info:
-                try:
-                    messages = [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": cropped},
-                            {"type": "text", "text": "Describe this document image briefly in Korean, focusing on information useful for retrieval."},
-                        ],
-                    }]
-                    prompt_text = qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    image_inputs, video_inputs = process_vision_info(messages)
-                    inputs = qwen_processor(
-                        text=[prompt_text],
-                        images=image_inputs,
-                        videos=video_inputs,
-                        padding=True,
-                        return_tensors="pt",
-                    )
-                    inputs = inputs.to(qwen_model.device)
-                    generated_ids = qwen_model.generate(**inputs, max_new_tokens=220)
-                    trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-                    output_text = qwen_processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                    generated_desc = _normalize_multiline_text(output_text[0] if output_text else "")
-                    desc = f"{desc}\n{generated_desc}".strip() if desc and generated_desc else (desc or generated_desc)
-                except Exception as exc:
-                    logger.info("OpenDataLoader image caption failed: %s", exc)
-
-            if not desc:
-                desc = "(image)"
-
-            prefix_lines = []
-            section_line = _section_path(section_stack)
-            if section_line:
-                prefix_lines.append(section_line)
-            if caption and caption.get("text"):
-                prefix_lines.append(f"Caption: {caption['text']}")
-
-            _append_chunk(desc, [prov, caption["prov"]] if caption else [prov], prefix_lines=prefix_lines, file_name=str(save_path))
+            pending_caption = None
             prev_body_bbox_x = None
             continue
 
