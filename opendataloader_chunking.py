@@ -985,6 +985,83 @@ def _parallel_list_records_from_rows(data_rows: List[dict], headers: List[str]) 
     return records
 
 
+def _split_compact_list_text(text: str) -> List[str]:
+    text = _normalize_multiline_text(text)
+    if not text:
+        return []
+    parts = [part.strip() for part in re.split(r"\s{2,}", text) if part.strip()]
+    if len(parts) >= 2:
+        return parts
+    return [part.strip() for part in text.split() if part.strip()]
+
+
+def _is_headerless_paired_row_table(rows: List[dict]) -> bool:
+    """
+    첫 row도 데이터이며, 각 row에서
+    col2 항목 리스트 <-> col3 값 리스트가 1:1 대응하고
+    col4는 shared note인 표를 감지합니다.
+    """
+    if len(rows) < 2:
+        return False
+
+    matched_rows = 0
+    for row in rows:
+        cells = row.get("cells", [])
+        if len(cells) < 3:
+            continue
+        left_items = _split_compact_list_text(_cell_text(cells[1]))
+        right_items = _split_compact_list_text(_cell_text(cells[2]))
+        if len(left_items) >= 2 and len(left_items) == len(right_items):
+            matched_rows += 1
+
+    return matched_rows >= max(2, len(rows) // 2)
+
+
+def _headerless_paired_row_records(rows: List[dict]) -> List[dict]:
+    records = []
+    for row in rows:
+        cells = row.get("cells", [])
+        if len(cells) < 3:
+            continue
+
+        category = _normalize_multiline_text(_cell_text(cells[0]))
+        left_items = _split_compact_list_text(_cell_text(cells[1]))
+        right_items = _split_compact_list_text(_cell_text(cells[2]))
+        shared_note = _normalize_multiline_text(_cell_text(cells[3])) if len(cells) > 3 else ""
+
+        if category and left_items and len(left_items) == len(right_items) and len(left_items) >= 2:
+            for idx, item in enumerate(left_items):
+                count_value = right_items[idx] if idx < len(right_items) else ""
+                values = {
+                    "category": category,
+                    _to_field_key(item): count_value,
+                }
+                if shared_note:
+                    values["note"] = shared_note
+                records.append({
+                    "row_number": row.get("row number"),
+                    "values": values,
+                })
+            continue
+
+        values = {}
+        if category:
+            values["category"] = category
+        if left_items:
+            values["details"] = " ; ".join(left_items)
+        if right_items:
+            values["counts"] = " ; ".join(right_items)
+        if shared_note:
+            values["note"] = shared_note
+        if values:
+            records.append({
+                "row_number": row.get("row number"),
+                "values": values,
+            })
+
+    return records
+
+
 def _detect_table_type(data_rows: list, num_cols: int, header_row_count: int = 1) -> tuple:
     if _is_parallel_list_table(data_rows, num_cols):
         return ("parallel_list",)
@@ -1291,6 +1368,22 @@ def table_to_simple(table: dict) -> dict:
     if not rows:
         return {}
 
+    stats = _table_stats(rows)
+    linear_rows = _linearize_table_rows(rows)
+
+    if _is_headerless_paired_row_table(rows):
+        result = {
+            "table_id": table.get("id"),
+            "headers": [],
+            "header_row_count": 0,
+            "records": _headerless_paired_row_records(rows),
+            "type": "paired_row",
+            "layout_family": "paired_row",
+            "stats": stats,
+            "linear_rows": linear_rows,
+        }
+        return result
+
     is_property_sheet = _is_property_sheet_table(rows)
     header_row_count = _property_sheet_header_count(rows) if is_property_sheet else _infer_header_row_count(rows)
     headers = _compose_headers(rows[:header_row_count])
@@ -1301,6 +1394,8 @@ def table_to_simple(table: dict) -> dict:
         "headers": headers,
         "header_row_count": header_row_count,
         "records": [],
+        "stats": stats,
+        "linear_rows": linear_rows,
     }
 
     if not data_rows:
