@@ -824,6 +824,15 @@ def _detect_count_col_idx(data_rows: list, num_cols: int) -> int:
     return best_idx
 
 
+def _has_non_empty_cells_after_col(data_rows: List[dict], start_col_idx: int) -> bool:
+    for row in data_rows:
+        cells = row.get("cells", [])
+        for col_idx in range(start_col_idx, len(cells)):
+            if _cell_text(cells[col_idx]):
+                return True
+    return False
+
+
 def _build_items_count(count_kids: list, item_kids: list, label: str) -> list:
     count_map = {}
     for kid in count_kids:
@@ -863,15 +872,24 @@ def _find_subrow_anchor_col(cells: list) -> int:
     return -1
 
 
-def _detect_table_type(data_rows: list, num_cols: int) -> tuple:
+def _detect_table_type(data_rows: list, num_cols: int, header_row_count: int = 1) -> tuple:
     for row in data_rows:
         anchor = _find_subrow_anchor_col(row.get("cells", []))
         if anchor >= 0:
             return ("subrow", anchor)
 
+    # 멀티헤더 matrix 표는 count table로 오인하지 않도록 우선 차단합니다.
+    # 예: Location / No. / Combination > Mooring drum / Combination > Warping head / Remark
+    if header_row_count >= 2 and num_cols >= 4:
+        return ("text",)
+
     count_col = _detect_count_col_idx(data_rows, num_cols)
     if count_col >= 0:
         item_col = count_col + 1 if count_col + 1 < num_cols else count_col - 1
+        # count table은 보통 [category, count, item]처럼 단순 구조입니다.
+        # item_col 뒤에 실제 값이 계속 존재하면 matrix 성격일 가능성이 높으므로 제외합니다.
+        if num_cols > 3 and _has_non_empty_cells_after_col(data_rows, item_col + 1):
+            return ("text",)
         return ("count", count_col, item_col)
 
     return ("text",)
