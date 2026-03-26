@@ -883,7 +883,112 @@ def _find_subrow_anchor_col(cells: list) -> int:
     return -1
 
 
+def _list_items_from_cell(cell: dict) -> List[str]:
+    items = []
+    for kid in _cell_kids(cell):
+        text = _normalize_inline_text(kid.get("content", ""))
+        if text:
+            items.append(text)
+    return items
+
+
+def _is_parallel_list_table(data_rows: List[dict], num_cols: int) -> bool:
+    """
+    한 row 안에서 인접 컬럼의 항목 리스트가 1:1 대응되는 표 감지.
+
+    예1) col2 count list <-> col3 furniture list
+    예2) col2 role list  <-> col3 quantity list, col4는 shared note
+    """
+    if num_cols < 3:
+        return False
+
+    for row in data_rows:
+        cells = row.get("cells", [])
+        list_lengths = []
+        for cell in cells:
+            list_lengths.append(len(_list_items_from_cell(cell)))
+
+        for idx in range(len(list_lengths) - 1):
+            left_n = list_lengths[idx]
+            right_n = list_lengths[idx + 1]
+            if left_n >= 2 and right_n >= 2 and left_n == right_n:
+                return True
+
+    return False
+
+
+def _parallel_list_records_from_rows(data_rows: List[dict], headers: List[str]) -> List[dict]:
+    records = []
+    carry_values = [""] * len(headers)
+
+    for row in data_rows:
+        cells = row.get("cells", [])
+        if not cells:
+            continue
+
+        cell_lists = []
+        scalar_values = []
+        for col_idx in range(len(headers)):
+            cell = cells[col_idx] if col_idx < len(cells) else {}
+            items = _list_items_from_cell(cell) if isinstance(cell, dict) else []
+            scalar = _cell_text(cell) if isinstance(cell, dict) else ""
+            if not scalar and isinstance(cell, dict) and _is_zero_bbox(cell) and col_idx < len(carry_values):
+                scalar = carry_values[col_idx]
+            if scalar:
+                carry_values[col_idx] = scalar
+            cell_lists.append(items)
+            scalar_values.append(scalar)
+
+        pair_anchor = -1
+        for idx in range(len(headers) - 1):
+            left_n = len(cell_lists[idx])
+            right_n = len(cell_lists[idx + 1])
+            if left_n >= 2 and right_n >= 2 and left_n == right_n:
+                pair_anchor = idx
+                break
+
+        if pair_anchor < 0:
+            records.extend(_generic_records_from_rows([row], headers))
+            continue
+
+        # prefix/shared scalar columns
+        prefix_values = {}
+        for col_idx in range(pair_anchor):
+            value = scalar_values[col_idx] or (carry_values[col_idx] if col_idx < len(carry_values) else "")
+            if value:
+                prefix_values[headers[col_idx]] = value
+
+        left_header = headers[pair_anchor]
+        right_header = headers[pair_anchor + 1]
+        pair_count = len(cell_lists[pair_anchor])
+
+        for item_idx in range(pair_count):
+            values = dict(prefix_values)
+            values[left_header] = cell_lists[pair_anchor][item_idx]
+            values[right_header] = cell_lists[pair_anchor + 1][item_idx]
+
+            # 이후 컬럼은 단일 shared note로 취급
+            for col_idx in range(pair_anchor + 2, len(headers)):
+                shared = scalar_values[col_idx]
+                if not shared and len(cell_lists[col_idx]) == pair_count:
+                    shared = cell_lists[col_idx][item_idx]
+                elif not shared and cell_lists[col_idx]:
+                    shared = " ; ".join(cell_lists[col_idx])
+                if shared:
+                    values[headers[col_idx]] = shared
+
+            records.append({
+                "row_number": row.get("row number"),
+                "values": values,
+            })
+
+    return records
+
+
 def _detect_table_type(data_rows: list, num_cols: int, header_row_count: int = 1) -> tuple:
+    if _is_parallel_list_table(data_rows, num_cols):
+        return ("parallel_list",)
+
     for row in data_rows:
         anchor = _find_subrow_anchor_col(row.get("cells", []))
         if anchor >= 0:
@@ -1212,9 +1317,12 @@ def table_to_simple(table: dict) -> dict:
         result["records"] = _hierarchical_to_records(data_rows)
         return result
 
-    table_type = _detect_table_type(data_rows, len(headers))
+    table_type = _detect_table_type(data_rows, len(headers), header_row_count=header_row_count)
 
-    if table_type[0] == "subrow":
+    if table_type[0] == "parallel_list":
+        result["type"] = "parallel_list"
+        result["records"] = _parallel_list_records_from_rows(data_rows, headers)
+    elif table_type[0] == "subrow":
         _, anchor_col = table_type
         result["type"] = "subrow"
         result["records"] = _subrow_records_from_rows(data_rows, headers, anchor_col)
