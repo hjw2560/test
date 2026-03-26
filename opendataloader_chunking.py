@@ -1443,8 +1443,8 @@ def _section_path(section_stack: List[Dict[str, Any]]) -> str:
     titles = [item["title"] for item in section_stack if item.get("title")]
     if not titles:
         return ""
-    # 너무 긴 prefix는 검색 효율과 가독성을 같이 떨어뜨리므로 최근 섹션만 유지합니다.
-    return " > ".join(titles[-3:])
+    # BM25/keyword 검색 오염을 줄이기 위해 현재 leaf heading만 사용합니다.
+    return titles[-1]
 
 
 def _collect_elements_with_content(node: Any, out: list):
