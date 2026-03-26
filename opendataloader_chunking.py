@@ -19,7 +19,10 @@ Production-oriented principles:
 """
 
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -172,6 +175,29 @@ def _format_chunk_text(prefix_lines: List[str], body: str) -> str:
     if prefix and body:
         return f"{prefix}\n\n{body}"
     return prefix or body
+
+
+def _bool_setting(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _int_setting(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_runtime_setting(name: str, default: Any = None) -> Any:
+    try:
+        from django.conf import settings as django_settings  # type: ignore
+        return getattr(django_settings, name, default)
+    except Exception:
+        return os.getenv(name, default)
 
 
 # ── 테이블 파싱 헬퍼 ──────────────────────────────────────────────────────────
