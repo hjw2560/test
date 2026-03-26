@@ -177,6 +177,13 @@ def _format_chunk_text(prefix_lines: List[str], body: str) -> str:
     return prefix or body
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
 def _bool_setting(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -324,6 +331,289 @@ def _compose_headers(header_rows: List[dict]) -> List[str]:
                 parts.append(value)
         headers.append(" > ".join(parts) if parts else f"col{col_idx + 1}")
     return headers
+
+
+def _flatten_cell_for_line(cell: dict) -> str:
+    return _normalize_inline_text(_cell_text(cell).replace("\n", " / "))
+
+
+def _table_stats(rows: List[dict]) -> Dict[str, int]:
+    total_cells = 0
+    merged_cells = 0
+    multiline_cells = 0
+    non_empty_cells = 0
+    max_cols = 0
+
+    for row in rows:
+        cells = row.get("cells", [])
+        max_cols = max(max_cols, len(cells))
+        for cell in cells:
+            total_cells += 1
+            if _is_zero_bbox(cell):
+                merged_cells += 1
+            value = _cell_text(cell)
+            if value:
+                non_empty_cells += 1
+            if len(_cell_kids(cell)) > 1 or "\n" in value:
+                multiline_cells += 1
+
+    return {
+        "row_count": len(rows),
+        "column_count": max_cols,
+        "total_cells": total_cells,
+        "merged_cells": merged_cells,
+        "multiline_cells": multiline_cells,
+        "non_empty_cells": non_empty_cells,
+        "empty_cells": max(0, total_cells - non_empty_cells),
+    }
+
+
+def _is_generic_header(header: str) -> bool:
+    return bool(re.fullmatch(r"col\d+", _normalize_inline_text(header), re.IGNORECASE))
+
+
+def _headers_are_weak(headers: List[str]) -> bool:
+    if not headers:
+        return True
+    meaningful = [header for header in headers if header and not _is_generic_header(header)]
+    return len(meaningful) < max(1, len(headers) // 2)
+
+
+def _linearize_table_rows(rows: List[dict]) -> List[Dict[str, Any]]:
+    linear_rows = []
+    carry_values: List[str] = []
+
+    for row in rows:
+        cells = row.get("cells", [])
+        if len(carry_values) < len(cells):
+            carry_values.extend([""] * (len(cells) - len(carry_values)))
+
+        values = []
+        has_value = False
+        for idx, cell in enumerate(cells):
+            value = _flatten_cell_for_line(cell)
+            if not value and _is_zero_bbox(cell) and idx < len(carry_values):
+                value = carry_values[idx]
+            if value:
+                carry_values[idx] = value
+                has_value = True
+            values.append(value)
+
+        if has_value:
+            linear_rows.append({
+                "row_number": row.get("row number"),
+                "values": values,
+            })
+
+    return linear_rows
+
+
+def _table_layout_family(table_type: str, headers: List[str], stats: Dict[str, int]) -> str:
+    if table_type == "hierarchical":
+        return "hierarchical"
+    if table_type == "subrow":
+        return "grouped_list"
+    if table_type == "count":
+        return "matrix"
+    if _headers_are_weak(headers):
+        return "freeform_layout"
+    if stats.get("merged_cells", 0) > max(1, stats.get("total_cells", 0) // 4):
+        return "grouped_list"
+    return "matrix"
+
+
+def _table_info_lines(simple: Dict[str, Any], content_type: str) -> List[str]:
+    table_id = simple.get("table_id")
+    stats = simple.get("stats", {})
+    return [
+        f"Content Type: {content_type}",
+        f"Table Name: Table {table_id}" if table_id is not None else "Table Name: Table",
+        (
+            "Table Info: "
+            f"rows={stats.get('row_count', 0)}, "
+            f"cols={stats.get('column_count', 0)}, "
+            f"header_rows={simple.get('header_row_count', 0)}, "
+            f"layout={simple.get('layout_family', simple.get('type', 'unknown'))}, "
+            f"merged_cells={stats.get('merged_cells', 0)}, "
+            f"multiline_cells={stats.get('multiline_cells', 0)}"
+        ),
+    ]
+
+
+def _build_table_raw_chunk(simple: Dict[str, Any]) -> str:
+    headers = simple.get("headers", [])
+    data_lines = []
+    for row in simple.get("linear_rows", []):
+        joined = " | ".join(value for value in row.get("values", []) if value != "")
+        if joined:
+            data_lines.append(f"[Row {row.get('row_number')}] {joined}".strip())
+
+    lines = _table_info_lines(simple, "table_raw")
+    if headers:
+        lines.append("Headers: " + " | ".join(headers))
+    if data_lines:
+        lines.append("Rows:")
+        lines.extend(data_lines)
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
+    headers = simple.get("headers", [])
+    chunks = []
+
+    if simple.get("layout_family") == "freeform_layout":
+        for row in simple.get("linear_rows", []):
+            joined = " | ".join(value for value in row.get("values", []) if value != "")
+            if not joined:
+                continue
+            lines = _table_info_lines(simple, "table_layout")
+            lines.append(f"Row Number: {row.get('row_number')}")
+            lines.append("Layout Row: " + joined)
+            chunks.append("\n".join(line for line in lines if line).strip())
+        return chunks
+
+    for record in simple.get("records", []):
+        values = record.get("values", {})
+        lines = _table_info_lines(simple, "table_record")
+        if headers:
+            lines.append("Columns: " + " | ".join(headers))
+        if record.get("row_number") is not None:
+            lines.append(f"Row Number: {record.get('row_number')}")
+        for header in headers or list(values.keys()):
+            value = _normalize_multiline_text(values.get(header, ""))
+            if value:
+                lines.append(f"{header}: {value}")
+        text = "\n".join(line for line in lines if line).strip()
+        if text:
+            chunks.append(text)
+
+    return chunks
+
+
+def _should_generate_table_summary(simple: Dict[str, Any]) -> bool:
+    stats = simple.get("stats", {})
+    if simple.get("layout_family") == "freeform_layout":
+        return True
+    if simple.get("header_row_count", 0) >= 2:
+        return True
+    if stats.get("merged_cells", 0) >= 2:
+        return True
+    if stats.get("multiline_cells", 0) >= 2:
+        return True
+    if stats.get("row_count", 0) >= 6:
+        return True
+    if simple.get("type") in {"hierarchical", "subrow"}:
+        return True
+    return False
+
+
+def _build_table_summary_prompt(simple: Dict[str, Any], raw_chunk: str) -> str:
+    headers = simple.get("headers", [])
+    prompt_lines = [
+        "다음 표를 검색용으로 요약하라.",
+        "표에 없는 내용은 추론하지 말고, 불확실하면 불확실하다고 명시하라.",
+        "반드시 포함할 항목:",
+        "1. 표의 목적",
+        "2. 행 기준 분류",
+        "3. 열 기준 분류",
+        "4. 주요 수치 또는 속성",
+        "5. 예외/remark",
+        "6. 구조가 애매한 부분",
+        "",
+        "표 메타:",
+        *(_table_info_lines(simple, "table_summary")),
+    ]
+    if headers:
+        prompt_lines.append("헤더: " + " | ".join(headers))
+    prompt_lines.extend([
+        "",
+        "표 원문:",
+        _truncate_text(raw_chunk, 5000),
+    ])
+    return "\n".join(prompt_lines).strip()
+
+
+def _summarize_table_via_chat_api(simple: Dict[str, Any], raw_chunk: str) -> str:
+    use_llm_summary = _bool_setting(_get_runtime_setting("OPENDATALOADER_USE_CHAT_TABLE_SUMMARY", False), False)
+    if not use_llm_summary:
+        return ""
+
+    api_root = (_get_runtime_setting("CHAT_QA_CHAT_JSON_URL", "") or "").strip()
+    db_name = (_get_runtime_setting("MILVUS_DB_NAME", "") or "").strip()
+    if not api_root or not db_name:
+        return ""
+
+    payload = {
+        "query": _build_table_summary_prompt(simple, raw_chunk),
+        "db_name": db_name,
+        "top_k": 1,
+        "own": "PRJT_000000",
+        "grop_id": None,
+        "chat_id": 0,
+        "llm_params": {
+            "model_name": "gpt-4o-mini",
+            "temperature": 0.2,
+            "max_tokens": _int_setting(_get_runtime_setting("OPENDATALOADER_TABLE_SUMMARY_MAX_TOKENS", 500), 500),
+            "prompt": None,
+        },
+        "use_web_search": False,
+        "fast_mode": True,
+    }
+    req = urllib.request.Request(
+        api_root.rstrip("/") + "/api/v1/chat_json",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return _normalize_multiline_text((body.get("result") or "").strip())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.info("OpenDataLoader table summary failed for table %s: %s", simple.get("table_id"), exc)
+        return ""
+
+
+def _heuristic_table_summary(simple: Dict[str, Any]) -> str:
+    headers = [header for header in simple.get("headers", []) if header and not _is_generic_header(header)]
+    stats = simple.get("stats", {})
+    records = simple.get("records", [])
+    layout_family = simple.get("layout_family", simple.get("type", "unknown"))
+
+    summary_lines = _table_info_lines(simple, "table_summary")
+    summary_lines.append("Summary:")
+
+    if headers:
+        lead = headers[0]
+        rest = ", ".join(headers[1:4]) if len(headers) > 1 else "세부 값"
+        summary_lines.append(
+            f"- 이 표는 주로 {lead} 기준으로 정보를 정리하고, {rest} 항목을 함께 보여줍니다."
+        )
+    else:
+        summary_lines.append("- 이 표는 비정형 레이아웃으로 구성되어 있으며 원문 행 기준으로 해석하는 것이 안전합니다.")
+
+    summary_lines.append(
+        f"- 구조 유형은 {layout_family}이며, 총 {stats.get('row_count', 0)}행 {stats.get('column_count', 0)}열 규모입니다."
+    )
+
+    if simple.get("header_row_count", 0) >= 2 or stats.get("merged_cells", 0) > 0:
+        summary_lines.append("- 다중 헤더 또는 병합 셀 흔적이 있어 표 구조를 완전히 고정된 컬럼으로 해석하기 어렵습니다.")
+
+    if records:
+        sample_lines = []
+        for record in records[:2]:
+            values = record.get("values", {})
+            parts = []
+            for header in simple.get("headers", [])[:4]:
+                value = _normalize_inline_text(values.get(header, ""))
+                if value:
+                    parts.append(f"{header}={value}")
+            if parts:
+                sample_lines.append("; ".join(parts))
+        if sample_lines:
+            summary_lines.append("- 예시 행: " + " || ".join(sample_lines))
+
+    return "\n".join(summary_lines).strip()
 
 
 def _detect_count_col_idx(data_rows: list, num_cols: int) -> int:
