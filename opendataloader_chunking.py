@@ -337,6 +337,70 @@ def _flatten_cell_for_line(cell: dict) -> str:
     return _normalize_inline_text(_cell_text(cell).replace("\n", " / "))
 
 
+def _row_non_empty_texts(row: dict) -> List[str]:
+    return [value for value in _row_texts(row.get("cells", []), forward_fill_merged=False) if value]
+
+
+def _is_property_sheet_table(rows: List[dict]) -> bool:
+    """
+    세로형 property/value 사양 표 감지.
+
+    전형 패턴:
+      row1: Quantity | One (1) | ""
+      row2: Type | Self-contained... | ""
+      row6: Speed | Hoisting | Appx. 10 m/min...
+      row7: ""    | Slewing  | Manufacturer's standard
+
+    즉 첫 컬럼이 속성명 역할을 많이 하고, 값이 뒤 컬럼에 세로로 이어집니다.
+    """
+    if len(rows) < 4:
+        return False
+
+    first_col_label_rows = 0
+    continued_label_rows = 0
+    three_value_rows = 0
+    total_considered = 0
+
+    for row in rows:
+        cells = row.get("cells", [])
+        if not cells:
+            continue
+        total_considered += 1
+        col1 = _cell_text(cells[0]) if len(cells) > 0 else ""
+        col2 = _cell_text(cells[1]) if len(cells) > 1 else ""
+        col3 = _cell_text(cells[2]) if len(cells) > 2 else ""
+
+        if col1 and col2:
+            first_col_label_rows += 1
+        if (not col1) and col2 and col3:
+            continued_label_rows += 1
+        if col1 and col2 and col3:
+            three_value_rows += 1
+
+    if total_considered == 0:
+        return False
+
+    return (
+        first_col_label_rows >= max(3, total_considered // 3)
+        and (continued_label_rows >= 1 or three_value_rows >= 1)
+    )
+
+
+def _property_sheet_header_count(rows: List[dict]) -> int:
+    """
+    property sheet는 보통 별도 헤더가 없으므로 기본 0.
+    다만 첫 row가 명백히 title/header처럼 보이면 1만 허용.
+    """
+    if not rows:
+        return 0
+    first_texts = _row_non_empty_texts(rows[0])
+    if len(first_texts) >= 2:
+        return 0
+    if first_texts and _looks_like_header_label(first_texts[0]):
+        return 1
+    return 0
+
+
 def _table_stats(rows: List[dict]) -> Dict[str, int]:
     total_cells = 0
     merged_cells = 0
@@ -409,6 +473,8 @@ def _linearize_table_rows(rows: List[dict]) -> List[Dict[str, Any]]:
 
 
 def _table_layout_family(table_type: str, headers: List[str], stats: Dict[str, int]) -> str:
+    if table_type == "property_sheet":
+        return "property_sheet"
     if table_type == "hierarchical":
         return "hierarchical"
     if table_type == "subrow":
@@ -465,6 +531,10 @@ def _kv_value(value: Any) -> str:
     return value.replace("\n", " ; ")
 
 
+def _join_non_empty(parts: List[str], sep: str = " ; ") -> str:
+    return sep.join([part for part in parts if _normalize_inline_text(part)])
+
+
 def _build_table_raw_chunk(simple: Dict[str, Any]) -> str:
     headers = simple.get("headers", [])
     data_lines = []
@@ -487,6 +557,26 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
     headers = simple.get("headers", [])
     key_map = _header_key_map(headers)
     chunks = []
+
+    if simple.get("layout_family") == "property_sheet":
+        for record in simple.get("records", []):
+            values = record.get("values", {})
+            lines = _table_info_lines(simple, "table_record")
+            if record.get("row_number") is not None:
+                lines.append(f"row_number={record.get('row_number')}")
+            if record.get("group_key"):
+                lines.append(f"group_key={record.get('group_key')}")
+            if record.get("group_label"):
+                lines.append(f"group_label={_kv_value(record.get('group_label'))}")
+            if record.get("sub_key"):
+                lines.append(f"sub_key={record.get('sub_key')}")
+            if record.get("sub_label"):
+                lines.append(f"sub_label={_kv_value(record.get('sub_label'))}")
+            for key, value in values.items():
+                if value:
+                    lines.append(f"{key}={_kv_value(value)}")
+            chunks.append("\n".join(line for line in lines if line).strip())
+        return chunks
 
     if simple.get("layout_family") == "freeform_layout":
         for row in simple.get("linear_rows", []):
@@ -521,6 +611,8 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
 
 def _should_generate_table_summary(simple: Dict[str, Any]) -> bool:
     stats = simple.get("stats", {})
+    if simple.get("layout_family") == "property_sheet":
+        return True
     if simple.get("layout_family") == "freeform_layout":
         return True
     if simple.get("header_row_count", 0) >= 2:
@@ -604,6 +696,21 @@ def _summarize_table_via_chat_api(simple: Dict[str, Any], raw_chunk: str) -> str
 
 
 def _heuristic_table_summary(simple: Dict[str, Any]) -> str:
+    if simple.get("layout_family") == "property_sheet":
+        summary_lines = _table_info_lines(simple, "table_summary")
+        records = simple.get("records", [])
+        summary_lines.append("summary=property/value 형식의 사양 표이며 첫 번째 컬럼은 속성명, 뒤 컬럼은 값 또는 하위 속성-값을 나타냅니다.")
+        if records:
+            sample_parts = []
+            for record in records[:3]:
+                values = record.get("values", {})
+                display = _join_non_empty([f"{k}={v}" for k, v in values.items()])
+                if display:
+                    sample_parts.append(display)
+            if sample_parts:
+                summary_lines.append("sample_1=" + " || ".join(sample_parts))
+        return "\n".join(summary_lines).strip()
+
     headers = [header for header in simple.get("headers", []) if header and not _is_generic_header(header)]
     stats = simple.get("stats", {})
     records = simple.get("records", [])
@@ -914,12 +1021,92 @@ def _count_records_from_rows(data_rows: List[dict], headers: List[str], count_co
     return records
 
 
+def _property_sheet_records_from_rows(data_rows: List[dict]) -> List[dict]:
+    records = []
+    current_group_key = ""
+    current_group_label = ""
+
+    for row in data_rows:
+        cells = row.get("cells", [])
+        if not cells:
+            continue
+
+        col1 = _normalize_multiline_text(_cell_text(cells[0]) if len(cells) > 0 else "")
+        col2 = _normalize_multiline_text(_cell_text(cells[1]) if len(cells) > 1 else "")
+        col3 = _normalize_multiline_text(_cell_text(cells[2]) if len(cells) > 2 else "")
+
+        if col1:
+            current_group_label = col1
+            current_group_key = _to_field_key(col1)
+
+        if col1 and col2 and not col3:
+            records.append({
+                "row_number": row.get("row number"),
+                "group_key": current_group_key,
+                "group_label": current_group_label,
+                "values": {
+                    current_group_key or "property": col2,
+                },
+            })
+            continue
+
+        if col1 and col2 and col3:
+            sub_key = _to_field_key(col2)
+            property_key = _join_non_empty([current_group_key, sub_key], sep="_") or "property"
+            records.append({
+                "row_number": row.get("row number"),
+                "group_key": current_group_key,
+                "group_label": current_group_label,
+                "sub_key": sub_key,
+                "sub_label": col2,
+                "values": {
+                    property_key: col3,
+                },
+            })
+            continue
+
+        if not col1 and col2 and col3 and current_group_key:
+            sub_key = _to_field_key(col2)
+            property_key = _join_non_empty([current_group_key, sub_key], sep="_") or "property"
+            records.append({
+                "row_number": row.get("row number"),
+                "group_key": current_group_key,
+                "group_label": current_group_label,
+                "sub_key": sub_key,
+                "sub_label": col2,
+                "values": {
+                    property_key: col3,
+                },
+            })
+            continue
+
+        fallback_parts = []
+        if col1:
+            fallback_parts.append(col1)
+        if col2:
+            fallback_parts.append(col2)
+        if col3:
+            fallback_parts.append(col3)
+        if fallback_parts:
+            records.append({
+                "row_number": row.get("row number"),
+                "group_key": current_group_key,
+                "group_label": current_group_label,
+                "values": {
+                    "property_text": " ; ".join(fallback_parts),
+                },
+            })
+
+    return records
+
+
 def table_to_simple(table: dict) -> dict:
     rows = table.get("rows", [])
     if not rows:
         return {}
 
-    header_row_count = _infer_header_row_count(rows)
+    is_property_sheet = _is_property_sheet_table(rows)
+    header_row_count = _property_sheet_header_count(rows) if is_property_sheet else _infer_header_row_count(rows)
     headers = _compose_headers(rows[:header_row_count])
     data_rows = rows[header_row_count:]
 
@@ -931,6 +1118,12 @@ def table_to_simple(table: dict) -> dict:
     }
 
     if not data_rows:
+        return result
+
+    if is_property_sheet:
+        result["type"] = "property_sheet"
+        result["records"] = _property_sheet_records_from_rows(data_rows)
+        result["layout_family"] = "property_sheet"
         return result
 
     if _is_hierarchical_table(data_rows, len(headers)):
