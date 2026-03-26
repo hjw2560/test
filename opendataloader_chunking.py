@@ -426,18 +426,43 @@ def _table_info_lines(simple: Dict[str, Any], content_type: str) -> List[str]:
     table_id = simple.get("table_id")
     stats = simple.get("stats", {})
     return [
-        f"Content Type: {content_type}",
-        f"Table Name: Table {table_id}" if table_id is not None else "Table Name: Table",
-        (
-            "Table Info: "
-            f"rows={stats.get('row_count', 0)}, "
-            f"cols={stats.get('column_count', 0)}, "
-            f"header_rows={simple.get('header_row_count', 0)}, "
-            f"layout={simple.get('layout_family', simple.get('type', 'unknown'))}, "
-            f"merged_cells={stats.get('merged_cells', 0)}, "
-            f"multiline_cells={stats.get('multiline_cells', 0)}"
-        ),
+        f"content_type={content_type}",
+        f"table_name=Table {table_id}" if table_id is not None else "table_name=Table",
+        f"table_rows={stats.get('row_count', 0)}",
+        f"table_cols={stats.get('column_count', 0)}",
+        f"header_rows={simple.get('header_row_count', 0)}",
+        f"table_layout={simple.get('layout_family', simple.get('type', 'unknown'))}",
+        f"merged_cells={stats.get('merged_cells', 0)}",
+        f"multiline_cells={stats.get('multiline_cells', 0)}",
     ]
+
+
+def _to_field_key(text: str) -> str:
+    text = _normalize_inline_text(text).lower()
+    text = text.replace(">", " ")
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "field"
+
+
+def _header_key_map(headers: List[str]) -> Dict[str, str]:
+    used = set()
+    mapping = {}
+    for idx, header in enumerate(headers):
+        base = _to_field_key(header if header and not _is_generic_header(header) else f"col_{idx + 1}")
+        key = base
+        suffix = 2
+        while key in used:
+            key = f"{base}_{suffix}"
+            suffix += 1
+        used.add(key)
+        mapping[header] = key
+    return mapping
+
+
+def _kv_value(value: Any) -> str:
+    value = _normalize_multiline_text("" if value is None else str(value))
+    return value.replace("\n", " ; ")
 
 
 def _build_table_raw_chunk(simple: Dict[str, Any]) -> str:
@@ -446,19 +471,21 @@ def _build_table_raw_chunk(simple: Dict[str, Any]) -> str:
     for row in simple.get("linear_rows", []):
         joined = " | ".join(value for value in row.get("values", []) if value != "")
         if joined:
-            data_lines.append(f"[Row {row.get('row_number')}] {joined}".strip())
+            row_no = row.get("row_number")
+            key = f"row_{row_no}" if row_no is not None else "row"
+            data_lines.append(f"{key}={joined}".strip())
 
     lines = _table_info_lines(simple, "table_raw")
     if headers:
-        lines.append("Headers: " + " | ".join(headers))
+        lines.append("headers=" + " | ".join(headers))
     if data_lines:
-        lines.append("Rows:")
         lines.extend(data_lines)
     return "\n".join(line for line in lines if line).strip()
 
 
 def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
     headers = simple.get("headers", [])
+    key_map = _header_key_map(headers)
     chunks = []
 
     if simple.get("layout_family") == "freeform_layout":
@@ -467,8 +494,9 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
             if not joined:
                 continue
             lines = _table_info_lines(simple, "table_layout")
-            lines.append(f"Row Number: {row.get('row_number')}")
-            lines.append("Layout Row: " + joined)
+            if row.get("row_number") is not None:
+                lines.append(f"row_number={row.get('row_number')}")
+            lines.append(f"layout_row={joined}")
             chunks.append("\n".join(line for line in lines if line).strip())
         return chunks
 
@@ -476,13 +504,14 @@ def _build_table_record_chunks(simple: Dict[str, Any]) -> List[str]:
         values = record.get("values", {})
         lines = _table_info_lines(simple, "table_record")
         if headers:
-            lines.append("Columns: " + " | ".join(headers))
+            lines.append("columns=" + " | ".join(headers))
         if record.get("row_number") is not None:
-            lines.append(f"Row Number: {record.get('row_number')}")
+            lines.append(f"row_number={record.get('row_number')}")
         for header in headers or list(values.keys()):
             value = _normalize_multiline_text(values.get(header, ""))
             if value:
-                lines.append(f"{header}: {value}")
+                field_key = key_map.get(header) or _to_field_key(header)
+                lines.append(f"{field_key}={_kv_value(value)}")
         text = "\n".join(line for line in lines if line).strip()
         if text:
             chunks.append(text)
@@ -581,37 +610,35 @@ def _heuristic_table_summary(simple: Dict[str, Any]) -> str:
     layout_family = simple.get("layout_family", simple.get("type", "unknown"))
 
     summary_lines = _table_info_lines(simple, "table_summary")
-    summary_lines.append("Summary:")
 
     if headers:
         lead = headers[0]
         rest = ", ".join(headers[1:4]) if len(headers) > 1 else "세부 값"
-        summary_lines.append(
-            f"- 이 표는 주로 {lead} 기준으로 정보를 정리하고, {rest} 항목을 함께 보여줍니다."
-        )
+        summary_lines.append(f"summary={lead} 기준으로 정리된 표이며 주요 항목은 {rest} 입니다.")
     else:
-        summary_lines.append("- 이 표는 비정형 레이아웃으로 구성되어 있으며 원문 행 기준으로 해석하는 것이 안전합니다.")
+        summary_lines.append("summary=비정형 레이아웃 표이므로 원문 행 기준으로 해석하는 것이 안전합니다.")
 
     summary_lines.append(
-        f"- 구조 유형은 {layout_family}이며, 총 {stats.get('row_count', 0)}행 {stats.get('column_count', 0)}열 규모입니다."
+        f"structure_note=layout={layout_family}, rows={stats.get('row_count', 0)}, cols={stats.get('column_count', 0)}"
     )
 
     if simple.get("header_row_count", 0) >= 2 or stats.get("merged_cells", 0) > 0:
-        summary_lines.append("- 다중 헤더 또는 병합 셀 흔적이 있어 표 구조를 완전히 고정된 컬럼으로 해석하기 어렵습니다.")
+        summary_lines.append("ambiguity_note=multi_header_or_merged_cells_detected")
 
     if records:
-        sample_lines = []
+        key_map = _header_key_map(simple.get("headers", []))
+        sample_idx = 1
         for record in records[:2]:
             values = record.get("values", {})
             parts = []
             for header in simple.get("headers", [])[:4]:
                 value = _normalize_inline_text(values.get(header, ""))
                 if value:
-                    parts.append(f"{header}={value}")
+                    field_key = key_map.get(header) or _to_field_key(header)
+                    parts.append(f"{field_key}={value}")
             if parts:
-                sample_lines.append("; ".join(parts))
-        if sample_lines:
-            summary_lines.append("- 예시 행: " + " || ".join(sample_lines))
+                summary_lines.append(f"sample_{sample_idx}=" + " ; ".join(parts))
+                sample_idx += 1
 
     return "\n".join(summary_lines).strip()
 
