@@ -356,6 +356,17 @@ def _is_property_sheet_table(rows: List[dict]) -> bool:
     if len(rows) < 4:
         return False
 
+    # 멀티헤더 matrix 표는 property sheet로 오인하면 안 됩니다.
+    # 예: row1=Location/No./Combination, row2=Mooring drum/Warping head/Remark
+    header_like_rows = 0
+    scan_rows = rows[: min(3, len(rows))]
+    for row in scan_rows:
+        texts = _row_non_empty_texts(row)
+        if len(texts) >= 3 and sum(1 for text in texts if _looks_like_header_label(text)) >= 2:
+            header_like_rows += 1
+    if header_like_rows >= 2:
+        return False
+
     first_col_label_rows = 0
     continued_label_rows = 0
     three_value_rows = 0
@@ -381,8 +392,8 @@ def _is_property_sheet_table(rows: List[dict]) -> bool:
         return False
 
     return (
-        first_col_label_rows >= max(3, total_considered // 3)
-        and (continued_label_rows >= 1 or three_value_rows >= 1)
+        first_col_label_rows >= max(4, total_considered // 2)
+        and (continued_label_rows >= 1 or three_value_rows >= 2)
     )
 
 
